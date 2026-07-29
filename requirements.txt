@@ -1,0 +1,11 @@
+硬體推薦：NVIDIA 4090 GPU。
+核心依賴套件包括以下：
+Python (≥ 3.9)
+datasets
+jiCER (用於 CER 計算)
+PyTorch (支援CUDA)
+Transformers
+Torchaudio
+Audiomentations, Nlpaug (資料增強)
+Jiwer (計算MER/WER)
+Pydub (音頻處理)
