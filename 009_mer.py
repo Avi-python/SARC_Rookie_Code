@@ -1,13 +1,16 @@
-import jiwer
-from difflib import SequenceMatcher
+import csv
 import os
+import jiwer
+from collections import defaultdict
+from difflib import SequenceMatcher
 
 def normalize_text(text):
     """
-    Normalize input text to lowercase (mainly for English).
-    Keeps other characters (e.g., Chinese) unchanged.
+    Normalize input text to lowercase and trim extra whitespace.
     """
-    return text.lower()
+    if text is None:
+        return ""
+    return str(text).lower().strip()
 
 def highlight_differences(ref, hyp):
     """
@@ -28,9 +31,16 @@ def highlight_differences(ref, hyp):
             highlighted_ref.extend(ref_words[i1:i2])
             highlighted_hyp.extend(hyp_words[j1:j2])
         elif tag == "replace":
-            for rw, hw in zip(ref_words[i1:i2], hyp_words[j1:j2]):
+            rw_slice = ref_words[i1:i2]
+            hw_slice = hyp_words[j1:j2]
+            min_len = min(len(rw_slice), len(hw_slice))
+            for rw, hw in zip(rw_slice[:min_len], hw_slice[:min_len]):
                 highlighted_ref.append(f"[SUB: {rw} -> {hw}]")
                 highlighted_hyp.append(f"[SUB: {hw}]")
+            for rw in rw_slice[min_len:]:
+                highlighted_ref.append(f"[DEL: {rw}]")
+            for hw in hw_slice[min_len:]:
+                highlighted_hyp.append(f"[INS: {hw}]")
         elif tag == "delete":
             for rw in ref_words[i1:i2]:
                 highlighted_ref.append(f"[DEL: {rw}]")
@@ -40,109 +50,199 @@ def highlight_differences(ref, hyp):
                 
     return " ".join(highlighted_ref), " ".join(highlighted_hyp)
 
-def load_data_by_id(file_path):
+def evaluate_transcriptions_csv(
+    input_csv="/mnt/usr1/avi/Projects/whisper_code/transcriptions.csv",
+    details_csv="/mnt/usr1/avi/Projects/whisper_code/eval_details.csv",
+    results_csv="/mnt/usr1/avi/Projects/whisper_code/eval_results.csv"
+):
     """
-    Load text data from file and return as a dict: {id: content}.
-    Each line should start with an ID followed by content.
+    Load transcriptions from input_csv (columns: index, language_id, ground_truth, prediction)
+    Compute WER, CER, and detailed metrics using jiwer,
+    save per-sample detailed results to details_csv (eval_details.csv),
+    and save overall evaluation metrics to results_csv (eval_results.csv).
     """
-    data = {}
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                parts = line.split(maxsplit=1)
-                if len(parts) == 2:
-                    news_id, content = parts
+    if not os.path.exists(input_csv):
+        print(f"Error: 找不到輸入檔案: {input_csv}")
+        return
+
+    all_refs = []
+    all_hyps = []
+    lang_refs = defaultdict(list)
+    lang_hyps = defaultdict(list)
+    rows_to_write = []
+
+    print(f"正在讀取 {input_csv} ...")
+    with open(input_csv, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            idx = row.get("index") if row.get("index") is not None else row.get("idx", "")
+            lang_id = row.get("language_id", "") or ""
+            ref = row.get("ground_truth", "") or ""
+            hyp = row.get("prediction", "") or ""
+            audio_size = row.get("audio_size", "") or ""
+
+            # 若推論階段有錯誤訊息
+            if hyp.startswith("ERROR:"):
+                rows_to_write.append({
+                    "idx": idx,
+                    "language_id": lang_id,
+                    "audio_size": audio_size,
+                    "Reference": ref,
+                    "Hypothesis": hyp,
+                    "WER": "N/A",
+                    "CER": "N/A",
+                    "Deletions": "N/A",
+                    "Substitutions": "N/A",
+                    "Insertions": "N/A",
+                    "Highlighted Differences": "ERROR in prediction"
+                })
+                continue
+
+            ref_norm = normalize_text(ref)
+            hyp_norm = normalize_text(hyp)
+
+            all_refs.append(ref_norm)
+            all_hyps.append(hyp_norm)
+            if lang_id:
+                lang_refs[lang_id].append(ref_norm)
+                lang_hyps[lang_id].append(hyp_norm)
+
+            # 計算單筆 WER 與 CER
+            try:
+                if not ref_norm and not hyp_norm:
+                    wer = 0.0
+                    cer = 0.0
+                    substitutions = 0
+                    deletions = 0
+                    insertions = 0
+                elif not ref_norm:
+                    wer = 1.0
+                    cer = 1.0
+                    substitutions = 0
+                    deletions = 0
+                    insertions = len(hyp_norm.split())
                 else:
-                    news_id, content = parts[0], ""
-                data[news_id] = content
-    return data
+                    # Word-level measures
+                    word_out = jiwer.process_words(ref_norm, hyp_norm)
+                    wer = word_out.wer
+                    substitutions = word_out.substitutions
+                    deletions = word_out.deletions
+                    insertions = word_out.insertions
 
-def calculate_wer_with_highlights_by_id(reference_file, hypothesis_file, output_file="/mnt/usr1/ethan1017/MLHW3/mer_results_before.txt"):
-    # Load reference and hypothesis data
-    ref_data = load_data_by_id(reference_file)
-    hyp_data = load_data_by_id(hypothesis_file)
-    
-    common_ids = set(ref_data.keys()) & set(hyp_data.keys())
-    missing_in_hyp = set(ref_data.keys()) - set(hyp_data.keys())
-    missing_in_ref = set(hyp_data.keys()) - set(ref_data.keys())
-    
-    if missing_in_hyp:
-        print("Warning: The following reference IDs are missing in hypothesis:", ", ".join(missing_in_hyp))
-    if missing_in_ref:
-        print("Warning: The following hypothesis IDs are missing in reference:", ", ".join(missing_in_ref))
-    
-    total_errors = 0
-    total_words = 0
-    total_del = 0
-    total_ins = 0
-    total_sub = 0
-    
-    with open(output_file, 'w', encoding='utf-8') as out_f:
-        out_f.write("=== Per-sample WER results ===\n\n")
-        
-        for news_id in sorted(common_ids):
-            ref_text = ref_data[news_id]
-            hyp_text = hyp_data[news_id]
-            
-            ref_norm = normalize_text(ref_text)
-            hyp_norm = normalize_text(hyp_text)
-            
-            # Fix: 使用 process_words 取代 compute_measures，並支援 jiwer 3.x
-            # 注意：這裡回傳的是一個 output 物件，不是字典
-            output = jiwer.process_words(ref_norm, hyp_norm)
-            
-            wer = output.wer
-            substitutions = output.substitutions
-            deletions = output.deletions
-            insertions = output.insertions
-            
-            # 如果需要手動計算 word count (分母)，通常是 len(ref)
-            # jiwer 的 output 物件裡也有，但為了保持你原本邏輯一致，維持原本寫法：
-            word_count = len(ref_norm.split())
-            
-            total_errors += substitutions + deletions + insertions
-            total_words += word_count
-            total_del += deletions
-            total_ins += insertions
-            total_sub += substitutions
-            
+                    # Character-level measures
+                    char_out = jiwer.process_characters(ref_norm, hyp_norm)
+                    cer = char_out.cer
+            except Exception as e:
+                wer = "N/A"
+                cer = "N/A"
+                substitutions = "N/A"
+                deletions = "N/A"
+                insertions = "N/A"
+
             highlighted_ref, highlighted_hyp = highlight_differences(ref_norm, hyp_norm)
-            
-            out_f.write(f"-- ID: {news_id}\n")
-            out_f.write(f"    Reference: {ref_text}\n")
-            out_f.write(f"    Hypothesis: {hyp_text}\n")
-            out_f.write(f"    WER: {wer:.4f}\n")
-            out_f.write(f"    Deletions (D): {deletions}\n")
-            out_f.write(f"    Substitutions (S): {substitutions}\n")
-            out_f.write(f"    Insertions (I): {insertions}\n")
-            out_f.write(f"    Word Count: {word_count}\n")
-            out_f.write(f"    Highlighted Differences:\n")
-            out_f.write(f"        Ref: {highlighted_ref}\n")
-            out_f.write(f"        Hyp: {highlighted_hyp}\n\n")
-        
-        # Summary
-        overall_wer = total_errors / total_words if total_words > 0 else 0
-        overall_del = total_del / total_words if total_words > 0 else 0
-        overall_ins = total_ins / total_words if total_words > 0 else 0
-        overall_sub = total_sub / total_words if total_words > 0 else 0
-        
-        out_f.write("=== Overall WER Summary ===\n")
-        out_f.write(f"   Overall WER: {overall_wer:.4f}\n")
-        out_f.write(f"   Deletion Rate: {overall_del:.4f}\n")
-        out_f.write(f"   Insertion Rate: {overall_ins:.4f}\n")
-        out_f.write(f"   Substitution Rate: {overall_sub:.4f}\n")
-        out_f.write(f"   Total Words: {total_words}\n")
-    
-    print(f"\nWER evaluation complete. Results saved to {output_file}")
-    return overall_wer
+            diff_str = f"Ref: {highlighted_ref} | Hyp: {highlighted_hyp}" if (highlighted_ref != highlighted_hyp) else "Match"
 
-# Example usage
-reference_txt = "/mnt/usr1/ethan1017/MLHW3/ref.txt"
-hypothesis_txt = "/mnt/usr1/ethan1017/MLHW3/hyp.txt"
+            rows_to_write.append({
+                "idx": idx,
+                "language_id": lang_id,
+                "audio_size": audio_size,
+                "Reference": ref,
+                "Hypothesis": hyp,
+                "WER": f"{wer:.4f}" if isinstance(wer, (int, float)) else str(wer),
+                "CER": f"{cer:.4f}" if isinstance(cer, (int, float)) else str(cer),
+                "Deletions": deletions,
+                "Substitutions": substitutions,
+                "Insertions": insertions,
+                "Highlighted Differences": diff_str
+            })
 
-# 檢查檔案是否存在，避免路徑錯誤
-if os.path.exists(reference_txt) and os.path.exists(hypothesis_txt):
-    calculate_wer_with_highlights_by_id(reference_txt, hypothesis_txt)
-else:
-    print(f"Error: 找不到輸入檔案。\n請確認 {reference_txt} 與 {hypothesis_txt} 路徑正確。")
+    # 寫入個別詳細評估結果 CSV
+    fieldnames = [
+        "idx",
+        "language_id",
+        "audio_size",
+        "Reference",
+        "Hypothesis",
+        "WER",
+        "CER",
+        "Deletions",
+        "Substitutions",
+        "Insertions",
+        "Highlighted Differences"
+    ]
+
+    with open(details_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows_to_write)
+
+    print(f"✅ 個別詳細評估結果已儲存至: {details_csv}")
+
+    # 計算整體 (Corpus-level) 與分語言 WER / CER，並寫入 eval_results.csv
+    overall_rows = []
+    if all_refs and all_hyps:
+        overall_word_out = jiwer.process_words(all_refs, all_hyps)
+        overall_char_out = jiwer.process_characters(all_refs, all_hyps)
+
+        print("\n" + "=" * 35 + " Overall Summary " + "=" * 35)
+        print(f"   Total Samples Processed: {len(all_refs)}")
+        print(f"   Overall WER            : {overall_word_out.wer:.4f} ({overall_word_out.wer * 100:.2f}%)")
+        print(f"   Overall CER            : {overall_char_out.cer:.4f} ({overall_char_out.cer * 100:.2f}%)")
+        print(f"   Word Substitutions (S) : {overall_word_out.substitutions}")
+        print(f"   Word Deletions (D)     : {overall_word_out.deletions}")
+        print(f"   Word Insertions (I)    : {overall_word_out.insertions}")
+        print(f"   Word Hits (H)          : {overall_word_out.hits}")
+        print("=" * 87 + "\n")
+
+        overall_rows.append({
+            "language_id": "OVERALL",
+            "total_samples": len(all_refs),
+            "wer": f"{overall_word_out.wer:.4f}",
+            "cer": f"{overall_char_out.cer:.4f}",
+            "substitutions": overall_word_out.substitutions,
+            "deletions": overall_word_out.deletions,
+            "insertions": overall_word_out.insertions,
+            "hits": overall_word_out.hits
+        })
+
+        if lang_refs:
+            for l_id in sorted(lang_refs.keys()):
+                l_refs = lang_refs[l_id]
+                l_hyps = lang_hyps[l_id]
+                if l_refs and l_hyps:
+                    l_word_out = jiwer.process_words(l_refs, l_hyps)
+                    l_char_out = jiwer.process_characters(l_refs, l_hyps)
+                    overall_rows.append({
+                        "language_id": l_id,
+                        "total_samples": len(l_refs),
+                        "wer": f"{l_word_out.wer:.4f}",
+                        "cer": f"{l_char_out.cer:.4f}",
+                        "substitutions": l_word_out.substitutions,
+                        "deletions": l_word_out.deletions,
+                        "insertions": l_word_out.insertions,
+                        "hits": l_word_out.hits
+                    })
+
+    summary_fieldnames = [
+        "language_id",
+        "total_samples",
+        "wer",
+        "cer",
+        "substitutions",
+        "deletions",
+        "insertions",
+        "hits"
+    ]
+
+    with open(results_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=summary_fieldnames)
+        writer.writeheader()
+        writer.writerows(overall_rows)
+
+    print(f"✅ 整體評估結果已儲存至: {results_csv}")
+
+if __name__ == "__main__":
+    input_csv = "/mnt/usr1/avi/Projects/whisper_code/transcriptions.csv"
+    details_csv = "/mnt/usr1/avi/Projects/whisper_code/eval_details.csv"
+    results_csv = "/mnt/usr1/avi/Projects/whisper_code/eval_results.csv"
+    evaluate_transcriptions_csv(input_csv, details_csv, results_csv)
