@@ -46,8 +46,8 @@ def transcribe(audio_path):
         input_features = processor.feature_extractor(speech_array, sampling_rate=16000).input_features
         input_features = torch.tensor(input_features).to(device)
 
-        # 強制使用中文進行轉錄
-        forced_decoder_ids = processor.get_decoder_prompt_ids(language="zh", task="transcribe")
+        # 強制使用印尼語進行轉錄
+        forced_decoder_ids = processor.get_decoder_prompt_ids(language="id", task="transcribe")
 
         # 執行推論
         with torch.no_grad():

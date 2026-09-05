@@ -27,20 +27,24 @@ output_file = "/mnt/usr1/avi/Projects/whisper_code/transcriptions.csv"
 # 限制推論筆數 (例如前 200 筆；若要跑選定 parquet 的全量可設為 None)
 max_samples = None
 
+# 推論目標語言 (預設: 印尼語 'id')
+target_language = "id"
+
 # %%
 # ===================== 載入 fine-tuned 模型與 processor =====================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"正在使用裝置: {device}")
 
 try:
-    processor = WhisperProcessor.from_pretrained(model_path)
+    processor = WhisperProcessor.from_pretrained(model_path, language=target_language, task="transcribe")
 except Exception:
     print(f"從 checkpoint 載入 processor 失敗，改由 base model ({base_model_name}) 載入...")
-    processor = WhisperProcessor.from_pretrained(base_model_name)
+    processor = WhisperProcessor.from_pretrained(base_model_name, language=target_language, task="transcribe")
 
 print(f"正在載入模型: {model_path} ...")
 model = WhisperForConditionalGeneration.from_pretrained(model_path).to(device)
 model.eval()
+forced_decoder_ids = processor.get_decoder_prompt_ids(language=target_language, task="transcribe")
 print("模型載入成功！")
 
 # %%
@@ -113,7 +117,7 @@ with open(output_file, "w", encoding="utf-8", newline="") as fout:
 
             # 5. 推論
             with torch.no_grad():
-                predicted_ids = model.generate(inputs.input_features)
+                predicted_ids = model.generate(inputs.input_features, forced_decoder_ids=forced_decoder_ids)
 
             # 6. 解碼成文字
             transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]

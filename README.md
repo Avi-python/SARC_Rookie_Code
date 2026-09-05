@@ -54,7 +54,7 @@
 
 這一組程式碼用於在本地端從訓練集 (Train Set) 切分出部分資料進行驗證，計算 Mixed Error Rate (MER) 以評估模型表現。
 
-- **`006_inference.py`**
+- **`inference_all.py`**
     - **功能**：模型推論測試。
     - **細節**：從訓練集中抓取前 200 筆音檔進行推論，將結果輸出為 `transcriptions_200.txt` (格式：`檔名 \t 預測文字`)。
 
@@ -62,11 +62,11 @@
     - **功能**：預測文字正規化。
     - **細節**：讀取 `transcriptions_200.txt`，移除標點符號 (`，。！？` 等) 並處理漢字間距，輸出 `hyp.txt` (Hypothesis)。
 
-- **`008_ref.py`**
+- **`ref.py`**
     - **功能**：準備標準答案 (Ground Truth)。
     - **細節**：讀取原始 `train.jsonl`，提取對應的真實文本並進行相同的正規化處理，輸出 `ref.txt` (Reference)。
 
-- **`009_mer.py`**
+- **`mer.py`**
     - **功能**：計算 MER (Mixed Error Rate) 與詳細錯誤分析。
     - **細節**：
         1. 比對 `ref.txt` 與 `hyp.txt`。
@@ -92,10 +92,10 @@
 ```python result.py```
 
 **4. 本地驗證 (Optional)**
-```python 006_inference.py```
+```python inference_all.py```
 ```python 007_transcriptions_normalize.py```
-```python 008_ref.py```
-```python 009_mer.py```
+```python ref.py```
+```python mer.py```
 
 ## 討論與心得
 

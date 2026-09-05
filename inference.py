@@ -232,8 +232,8 @@ def parse_args():
     parser.add_argument(
         "--language",
         type=str,
-        default=None,
-        help="強制指定語言代碼 (如 zh, en)，若未設定則由模型自動判定"
+        default="id",
+        help="強制指定語言代碼 (如 id 為印尼語，zh, en 等；預設為 id)"
     )
     return parser.parse_args()
 
