@@ -35,6 +35,7 @@ from transformers import (
     TrainingArguments,
     Trainer,
 )
+from transformers.trainer_utils import get_last_checkpoint
 import transformers.trainer
 import transformers.utils.import_utils
 import transformers.utils.logging
@@ -183,6 +184,7 @@ training_args = TrainingArguments(
     bf16=True,
     gradient_checkpointing=True,
     ddp_find_unused_parameters=False,
+    ddp_timeout=7200,
     dataloader_num_workers=4,
     remove_unused_columns=False,
     report_to="none",
@@ -197,7 +199,7 @@ with training_args.main_process_first(desc="Mapping dataset with prepare_example
     logging.info("Dataset mapped successfully!")
 
     before = len(dataset)
-    dataset = dataset.filter(lambda x: x["input_features"] is not None)
+    dataset = dataset.filter(lambda x: x["input_features"] is not None, num_proc=min(args.num_proc, os.cpu_count() or 4))
     logging.info(f"Dropped {before - len(dataset)} corrupted/invalid examples")
 
 
@@ -219,7 +221,16 @@ trainer = Trainer(
 
 if __name__ == "__main__":
     logging.info("Starting training...")
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+
+    checkpoint = None
+    if args.resume_from_checkpoint and os.path.isdir(args.output_dir):
+        checkpoint = get_last_checkpoint(args.output_dir)
+        if checkpoint is not None:
+            logging.info(f"Found checkpoint, resuming from: {checkpoint}")
+        else:
+            logging.info("No checkpoint found in output directory. Starting from scratch.")
+    trainer.train(resume_from_checkpoint=checkpoint)
+
     logging.info("Training finished! Saving final model...")
     trainer.save_model(os.path.join(args.output_dir, "final_model"))
     processor.save_pretrained(os.path.join(args.output_dir, "final_model"))
