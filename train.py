@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torchaudio
 import torchaudio.transforms as T
+import inspect
 from torch.nn.utils.rnn import pad_sequence
 from datasets import load_dataset
 from transformers import (
@@ -34,6 +35,7 @@ from transformers import (
     WhisperForConditionalGeneration,
     TrainingArguments,
     Trainer,
+    EarlyStoppingCallback,
 )
 from transformers.trainer_utils import get_last_checkpoint
 import transformers.trainer
@@ -69,9 +71,14 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--warmup_steps", type=int, default=100, help="Warmup steps")
     parser.add_argument("--save_steps", type=int, default=1500, help="Save checkpoint steps")
+    parser.add_argument("--eval_steps", type=int, default=1500, help="Evaluation steps (should match or divide save_steps)")
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=2, help="Batch size per GPU for evaluation")
+    parser.add_argument("--early_stopping_patience", type=int, default=3, help="Early stopping patience (number of evaluations without improvement before stopping, 0 to disable)")
+    parser.add_argument("--early_stopping_threshold", type=float, default=0.0, help="Minimum change in monitored metric to qualify as an improvement")
+    parser.add_argument("--max_eval_samples", type=int, default=None, help="Optional maximum number of samples from dev dataset to evaluate")
     parser.add_argument("--logging_steps", type=int, default=10, help="Logging steps")
     parser.add_argument("--resume_from_checkpoint", action="store_true", default=True, help="Resume from last checkpoint if exists")
-    parser.add_argument("--num_proc", type=int, default=8, help="Number of processes for dataset mapping")
+    parser.add_argument("--num_proc", type=int, default=8, help="Number of CPU workers for on-the-fly DataLoader preprocessing")
     return parser.parse_known_args()[0]
 
 
@@ -106,71 +113,124 @@ freq_masking = T.FrequencyMasking(freq_mask_param=27)
 time_masking = T.TimeMasking(time_mask_param=100)
 
 
-def prepare_example(example):
+def prepare_batch(batch, is_train=True):
     """
-    音訊預處理 + Parquet 解析 + SpecAugment + 標籤 Tokenizer (印尼語)
+    音訊即時預處理 + Parquet 解析 + 動態 SpecAugment (僅訓練集) + 標籤 Tokenizer (印尼語)
+    使用 set_transform 在 DataLoader 多核心 CPU 即時平行運算，不佔用任何硬碟快取。
     """
-    # 1. 提取 Parquet raw bytes
-    audio_bytes = example.get("audio_bytes")
-    if audio_bytes is None:
-        example["input_features"] = None
-        example["labels"] = None
-        return example
+    input_features_list = []
+    labels_list = []
 
-    audio_bytes = np.array(audio_bytes, dtype=np.int8).view(np.uint8).tobytes()
+    audio_bytes_list = batch["audio_bytes"] if isinstance(batch.get("audio_bytes"), list) else [batch.get("audio_bytes")]
+    text_list = batch["text"] if isinstance(batch.get("text"), list) else [batch.get("text")]
 
-    # 2. 直接由記憶體 buffer 讀取音訊
-    try:
-        speech_array, sr_orig = torchaudio.load(io.BytesIO(audio_bytes))
-    except Exception:
-        example["input_features"] = None
-        example["labels"] = None
-        return example
+    for audio_raw, text in zip(audio_bytes_list, text_list):
+        speech_array = None
+        if audio_raw is not None:
+            try:
+                # 1. 提取 Parquet raw bytes 並由記憶體 buffer 讀取
+                audio_bytes = np.array(audio_raw, dtype=np.int8).view(np.uint8).tobytes()
+                speech_array, sr_orig = torchaudio.load(io.BytesIO(audio_bytes))
+                # 2. 若取樣率非 16000Hz 則重取樣
+                if sr_orig != sr:
+                    resampler = T.Resample(sr_orig, sr)
+                    speech_array = resampler(speech_array)
+                speech_array = speech_array.squeeze().numpy()
+            except Exception:
+                speech_array = None
 
-    # 3. 若取樣率非 16000Hz 則重取樣
-    if sr_orig != sr:
-        resampler = T.Resample(sr_orig, sr)
-        speech_array = resampler(speech_array)
+        if speech_array is None or len(speech_array) == 0:
+            # 若音訊損壞或讀取失敗，使用 1 秒靜音作為 fallback，標籤設為 -100 (計算 loss 時自動忽略)
+            speech_array = np.zeros(sr, dtype=np.float32)
+            input_features = processor.feature_extractor(speech_array, sampling_rate=sr).input_features[0]
+            label_ids = [-100]
+        else:
+            # 3. Whisper 特徵轉換 (Log-Mel Spectrogram)
+            input_features = processor.feature_extractor(speech_array, sampling_rate=sr).input_features[0]
 
-    speech_array = speech_array.squeeze().numpy()
+            # 4. 動態 SpecAugment (僅在訓練集套用，每次 epoch 生成全新隨機頻譜遮罩，防止過擬合；驗證集使用原始特徵)
+            if is_train:
+                try:
+                    features_tensor = torch.tensor(input_features)
+                    features_tensor = freq_masking(features_tensor)
+                    features_tensor = freq_masking(features_tensor)
+                    features_tensor = time_masking(features_tensor)
+                    features_tensor = time_masking(features_tensor)
+                    input_features = features_tensor.numpy()
+                except Exception:
+                    pass
 
-    # 4. Whisper 特徵轉換 (Log-Mel Spectrogram)
-    input_features = processor.feature_extractor(speech_array, sampling_rate=sr).input_features[0]
+            # 5. 標籤 Tokenizer
+            label_ids = processor.tokenizer(text, max_length=448, truncation=True).input_ids
 
-    # 5. SpecAugment (頻譜遮罩增強: 2 次 Frequency Masking + 2 次 Time Masking)
-    try:
-        features_tensor = torch.tensor(input_features)
-        features_tensor = freq_masking(features_tensor)
-        features_tensor = freq_masking(features_tensor)
-        features_tensor = time_masking(features_tensor)
-        features_tensor = time_masking(features_tensor)
-        input_features = features_tensor.numpy()
-    except Exception as e:
-        pass
+        input_features_list.append(input_features)
+        labels_list.append(label_ids)
 
-    example["input_features"] = input_features
-
-    # 6. 標籤 Tokenizer (以毛利語 prompt 編碼)
-    labels = processor.tokenizer(example["text"], max_length=448, truncation=True).input_ids
-    example["labels"] = labels
-
-    return example
-
-
-# %% 搜尋並載入 Parquet 資料集
-logging.info(f"Searching parquet files under {args.data_dir}...")
-parquet_files = glob.glob(f"{args.data_dir}/**/split=train/**/*.parquet", recursive=True)
-logging.info(f"Found {len(parquet_files)} parquet files under {args.data_dir}")
-
-if not parquet_files:
-    raise FileNotFoundError(f"No parquet files found under directory: {args.data_dir}")
-
-logging.info("Loading dataset via Hugging Face `load_dataset`...")
-dataset = load_dataset("parquet", data_files={"train": parquet_files}, split="train")
-logging.info(f"Dataset loaded successfully! Total records: {len(dataset)}")
+    return {"input_features": input_features_list, "labels": labels_list}
 
 
-# %% 訓練設定 (支援多 GPU 分散式訓練 DDP)
+def prepare_train_batch(batch):
+    return prepare_batch(batch, is_train=True)
+
+
+def prepare_eval_batch(batch):
+    return prepare_batch(batch, is_train=False)
+
+
+# %% 搜尋並載入 Parquet 資料集 (Train & Dev)
+logging.info(f"Searching train parquet files under {args.data_dir}...")
+train_parquet_files = glob.glob(f"{args.data_dir}/**/split=train/**/*.parquet", recursive=True)
+logging.info(f"Found {len(train_parquet_files)} train parquet files under {args.data_dir}")
+
+if not train_parquet_files:
+    raise FileNotFoundError(f"No train parquet files found under directory: {args.data_dir}")
+
+logging.info("Loading train dataset via Hugging Face `load_dataset`...")
+train_dataset = load_dataset("parquet", data_files={"train": train_parquet_files}, split="train")
+logging.info(f"Train dataset loaded successfully! Total records: {len(train_dataset)}")
+
+logging.info(f"Searching dev parquet files under {args.data_dir}...")
+dev_parquet_files = glob.glob(f"{args.data_dir}/**/split=dev/**/*.parquet", recursive=True)
+logging.info(f"Found {len(dev_parquet_files)} dev parquet files under {args.data_dir}")
+
+eval_dataset = None
+if dev_parquet_files:
+    logging.info("Loading dev dataset via Hugging Face `load_dataset`...")
+    eval_dataset = load_dataset("parquet", data_files={"dev": dev_parquet_files}, split="dev")
+    if args.max_eval_samples is not None and args.max_eval_samples < len(eval_dataset):
+        logging.info(f"Subsampling dev dataset to {args.max_eval_samples} records for evaluation.")
+        eval_dataset = eval_dataset.select(range(args.max_eval_samples))
+    logging.info(f"Dev dataset loaded successfully! Total records: {len(eval_dataset)}")
+else:
+    logging.warning(f"No dev parquet files found under {args.data_dir} with split=dev. Evaluation and early stopping will be disabled.")
+
+
+# %% 訓練與評估設定 (支援多 GPU 分散式訓練 DDP + 多 CPU 核心 DataLoader 即時資料處理)
+eval_args = {}
+callbacks = []
+
+if eval_dataset is not None:
+    # 相容不同版本的 transformers (4.41+ 使用 eval_strategy，舊版使用 evaluation_strategy)
+    sig = inspect.signature(TrainingArguments.__init__)
+    if "eval_strategy" in sig.parameters:
+        eval_args["eval_strategy"] = "steps"
+    else:
+        eval_args["evaluation_strategy"] = "steps"
+    eval_args["eval_steps"] = args.eval_steps
+    eval_args["per_device_eval_batch_size"] = args.per_device_eval_batch_size
+    eval_args["load_best_model_at_end"] = True
+    eval_args["metric_for_best_model"] = "eval_loss"
+    eval_args["greater_is_better"] = False
+
+    if args.early_stopping_patience is not None and args.early_stopping_patience > 0:
+        callbacks.append(
+            EarlyStoppingCallback(
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_threshold=args.early_stopping_threshold,
+            )
+        )
+        logging.info(f"EarlyStoppingCallback enabled with patience={args.early_stopping_patience}, threshold={args.early_stopping_threshold}")
+
 training_args = TrainingArguments(
     output_dir=args.output_dir,
     per_device_train_batch_size=args.per_device_train_batch_size,
@@ -185,22 +245,24 @@ training_args = TrainingArguments(
     gradient_checkpointing=True,
     ddp_find_unused_parameters=False,
     ddp_timeout=7200,
-    dataloader_num_workers=4,
+    dataloader_num_workers=args.num_proc,
+    dataloader_prefetch_factor=2 if args.num_proc > 0 else None,
     remove_unused_columns=False,
     report_to="none",
     logging_first_step=True,
+    **eval_args,
 )
 
 
-# %% 套用映射 (多程序平行處理，在多 GPU / DDP 環境下由主程序先處理並快取)
-with training_args.main_process_first(desc="Mapping dataset with prepare_example (Parquet + SpecAugment)"):
-    logging.info(f"Mapping dataset with prepare_example function (num_proc={args.num_proc})...")
-    dataset = dataset.map(prepare_example, num_proc=min(args.num_proc, os.cpu_count() or 4))
-    logging.info("Dataset mapped successfully!")
+# %% 套用即時轉換 (使用 set_transform 免除硬碟快取，由 DataLoader 多核心 CPU 即時平行處理)
+logging.info(f"Applying dynamic on-the-fly preprocessing to train dataset (num_workers={args.num_proc})...")
+train_dataset.set_transform(prepare_train_batch)
 
-    before = len(dataset)
-    dataset = dataset.filter(lambda x: x["input_features"] is not None, num_proc=min(args.num_proc, os.cpu_count() or 4))
-    logging.info(f"Dropped {before - len(dataset)} corrupted/invalid examples")
+if eval_dataset is not None:
+    logging.info("Applying on-the-fly preprocessing to dev dataset (clean audio, no SpecAugment)...")
+    eval_dataset.set_transform(prepare_eval_batch)
+
+logging.info("Dataset set_transform configured successfully! No disk cache will be generated.")
 
 
 def data_collator(batch):
@@ -214,9 +276,11 @@ def data_collator(batch):
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=dataset,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
     data_collator=data_collator,
     processing_class=processor.tokenizer,
+    callbacks=callbacks,
 )
 
 if __name__ == "__main__":
