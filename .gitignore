@@ -6,4 +6,4 @@ __pycache__/
 *.m4a
 *.jsonl
 checkpoint-*/
-whisper-finetuned-formosan-v1/
+whisper-finetuned-formosan-*/

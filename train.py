@@ -60,18 +60,24 @@ os.environ["NCCL_IB_DISABLE"] = "1"
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Whisper Multi-GPU Fine-Tuning")
-    parser.add_argument("--model_name", type=str, default="openai/whisper-large-v3-turbo", help="Base model name or path")
+    default_base_model = (
+        "/mnt/usr1/avi/Projects/whisper_code/whisper-finetuned-formosan-v2/final_model-evaluation/final_model"
+        if os.path.exists("/mnt/usr1/avi/Projects/whisper_code/whisper-finetuned-formosan-v2/final_model-evaluation/final_model")
+        else "openai/whisper-large-v3-turbo"
+    )
+    parser.add_argument("--model_name", type=str, default=default_base_model, help="Base model name or path")
     parser.add_argument("--language", type=str, default="id", help="Target language code (default: id for Indonesian / 印尼語)")
     parser.add_argument("--task", type=str, default="transcribe", help="Task (transcribe or translate)")
+    parser.add_argument("--language_group", type=str, default="dru", help="Target language ID group (e.g. 'dru', or comma-separated 'dru,tsu'). Set to 'all' for all languages.")
     parser.add_argument("--data_dir", type=str, default="/nfs/DGX2/Workspace/avi/processed_data_independent3/", help="Parquet dataset root directory")
-    parser.add_argument("--output_dir", type=str, default="/mnt/usr1/avi/Projects/whisper_code/whisper-finetuned-formosan-v1", help="Output directory")
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory (default: whisper-finetuned-<language_group>)")
     parser.add_argument("--epochs", type=float, default=6, help="Number of training epochs")
     parser.add_argument("--per_device_train_batch_size", type=int, default=2, help="Batch size per GPU")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=6, help="Gradient accumulation steps")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--warmup_steps", type=int, default=100, help="Warmup steps")
-    parser.add_argument("--save_steps", type=int, default=1500, help="Save checkpoint steps")
-    parser.add_argument("--eval_steps", type=int, default=1500, help="Evaluation steps (should match or divide save_steps)")
+    parser.add_argument("--save_steps", type=int, default=300, help="Save checkpoint steps")
+    parser.add_argument("--eval_steps", type=int, default=300, help="Evaluation steps (should match or divide save_steps)")
     parser.add_argument("--per_device_eval_batch_size", type=int, default=2, help="Batch size per GPU for evaluation")
     parser.add_argument("--early_stopping_patience", type=int, default=3, help="Early stopping patience (number of evaluations without improvement before stopping, 0 to disable)")
     parser.add_argument("--early_stopping_threshold", type=float, default=0.0, help="Minimum change in monitored metric to qualify as an improvement")
@@ -79,7 +85,15 @@ def parse_args():
     parser.add_argument("--logging_steps", type=int, default=10, help="Logging steps")
     parser.add_argument("--resume_from_checkpoint", action="store_true", default=True, help="Resume from last checkpoint if exists")
     parser.add_argument("--num_proc", type=int, default=8, help="Number of CPU workers for on-the-fly DataLoader preprocessing")
-    return parser.parse_known_args()[0]
+    parsed = parser.parse_known_args()[0]
+
+    if parsed.output_dir is None:
+        if parsed.language_group and parsed.language_group.lower() != "all":
+            group_slug = parsed.language_group.replace(",", "_").replace(" ", "_")
+            parsed.output_dir = f"/mnt/usr1/avi/Projects/whisper_code/whisper-finetuned-formosan-{group_slug}"
+        else:
+            parsed.output_dir = "/mnt/usr1/avi/Projects/whisper_code/whisper-finetuned-formosan-v2"
+    return parsed
 
 
 # %% 基本全域設定
@@ -177,21 +191,42 @@ def prepare_eval_batch(batch):
     return prepare_batch(batch, is_train=False)
 
 
+def filter_parquet_files(files, language_group, data_dir):
+    if not language_group or language_group.lower() == "all":
+        return sorted(files)
+    groups = [g.strip() for g in language_group.split(",") if g.strip()]
+    matched = []
+    for f in files:
+        rel = os.path.relpath(f, data_dir)
+        top_folder = rel.split(os.sep)[0]
+        if any(top_folder == g or top_folder.startswith(f"{g}_") or top_folder.startswith(g) for g in groups):
+            matched.append(f)
+    return sorted(matched)
+
+
 # %% 搜尋並載入 Parquet 資料集 (Train & Dev)
-logging.info(f"Searching train parquet files under {args.data_dir}...")
-train_parquet_files = glob.glob(f"{args.data_dir}/**/split=train/**/*.parquet", recursive=True)
-logging.info(f"Found {len(train_parquet_files)} train parquet files under {args.data_dir}")
+logging.info(f"Searching train parquet files under {args.data_dir} (language_group: '{args.language_group}')...")
+all_train_parquet_files = glob.glob(f"{args.data_dir}/**/split=train/**/*.parquet", recursive=True)
+train_parquet_files = filter_parquet_files(all_train_parquet_files, args.language_group, args.data_dir)
+logging.info(f"Found {len(train_parquet_files)} matching train parquet files (out of {len(all_train_parquet_files)} total):")
+for f in train_parquet_files:
+    rel_dialect = os.path.relpath(f, args.data_dir).split(os.sep)[0]
+    logging.info(f"  - Train dialect [{rel_dialect}]: {f}")
 
 if not train_parquet_files:
-    raise FileNotFoundError(f"No train parquet files found under directory: {args.data_dir}")
+    raise FileNotFoundError(f"No train parquet files found matching language_group '{args.language_group}' under directory: {args.data_dir}")
 
 logging.info("Loading train dataset via Hugging Face `load_dataset`...")
 train_dataset = load_dataset("parquet", data_files={"train": train_parquet_files}, split="train")
 logging.info(f"Train dataset loaded successfully! Total records: {len(train_dataset)}")
 
-logging.info(f"Searching dev parquet files under {args.data_dir}...")
-dev_parquet_files = glob.glob(f"{args.data_dir}/**/split=dev/**/*.parquet", recursive=True)
-logging.info(f"Found {len(dev_parquet_files)} dev parquet files under {args.data_dir}")
+logging.info(f"Searching dev parquet files under {args.data_dir} (language_group: '{args.language_group}')...")
+all_dev_parquet_files = glob.glob(f"{args.data_dir}/**/split=dev/**/*.parquet", recursive=True)
+dev_parquet_files = filter_parquet_files(all_dev_parquet_files, args.language_group, args.data_dir)
+logging.info(f"Found {len(dev_parquet_files)} matching dev parquet files (out of {len(all_dev_parquet_files)} total):")
+for f in dev_parquet_files:
+    rel_dialect = os.path.relpath(f, args.data_dir).split(os.sep)[0]
+    logging.info(f"  - Dev dialect [{rel_dialect}]: {f}")
 
 eval_dataset = None
 if dev_parquet_files:
@@ -202,7 +237,7 @@ if dev_parquet_files:
         eval_dataset = eval_dataset.select(range(args.max_eval_samples))
     logging.info(f"Dev dataset loaded successfully! Total records: {len(eval_dataset)}")
 else:
-    logging.warning(f"No dev parquet files found under {args.data_dir} with split=dev. Evaluation and early stopping will be disabled.")
+    logging.warning(f"No dev parquet files found under {args.data_dir} matching '{args.language_group}' with split=dev. Evaluation and early stopping will be disabled.")
 
 
 # %% 訓練與評估設定 (支援多 GPU 分散式訓練 DDP + 多 CPU 核心 DataLoader 即時資料處理)

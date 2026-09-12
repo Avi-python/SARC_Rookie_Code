@@ -242,7 +242,7 @@ def evaluate_transcriptions_csv(
     print(f"✅ 整體評估結果已儲存至: {results_csv}")
 
 if __name__ == "__main__":
-    input_csv = "/mnt/usr1/avi/Projects/whisper_code/transcriptions.csv"
-    details_csv = "/mnt/usr1/avi/Projects/whisper_code/eval_details.csv"
-    results_csv = "/mnt/usr1/avi/Projects/whisper_code/eval_results.csv"
+    input_csv = "/mnt/usr1/avi/Projects/whisper_code/kaldi_transcriptions_dru_o_to_u.csv"
+    details_csv = "/mnt/usr1/avi/Projects/whisper_code/kaldi_eval_details_dru_o_to_u.csv"
+    results_csv = "/mnt/usr1/avi/Projects/whisper_code/kaldi_eval_results_dru_o_to_u.csv"
     evaluate_transcriptions_csv(input_csv, details_csv, results_csv)

@@ -4,6 +4,7 @@ import io
 import glob
 import torch
 import csv
+import argparse
 import torchaudio
 import numpy as np
 from collections import defaultdict
@@ -13,27 +14,76 @@ from tqdm import tqdm
 
 # %%
 # ===================== 路徑與參數設定 =====================
-# 模型路徑 (支援 Projects 與非 Projects 路徑)
-model_path = "/mnt/usr1/avi/Projects/whisper_code/checkpoint-165000-evaluation/checkpoint-165000"
+def parse_args():
+    parser = argparse.ArgumentParser(description="Whisper Batch Inference with Language Filter")
+    parser.add_argument("--language_group", "--language_id", dest="language_group", type=str, default="dru",
+                        help="Target language ID group (e.g. 'dru', 'dru,tsu'). Set to 'all' for all languages.")
+    parser.add_argument("--root_dir", type=str, default="/nfs/DGX2/Workspace/avi/processed_data_independent3/",
+                        help="Parquet dataset root directory")
+    parser.add_argument("--model_path", type=str, default=None,
+                        help="Model directory or checkpoint path")
+    parser.add_argument("--base_model_name", type=str, default="openai/whisper-large-v3-turbo",
+                        help="Fallback base model for processor")
+    parser.add_argument("--output_file", type=str, default=None,
+                        help="Output CSV path (default: transcriptions_<language_group>.csv)")
+    parser.add_argument("--target_language", type=str, default="id",
+                        help="Whisper target decoding language code (default: 'id')")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Max samples to infer (default: None for all)")
+    parsed = parser.parse_known_args()[0]
 
-base_model_name = "openai/whisper-large-v3-turbo"
+    group_slug = parsed.language_group.replace(",", "_").replace(" ", "_") if parsed.language_group and parsed.language_group.lower() != "all" else "all"
 
-# Parquet 資料集目錄 (參照 train_test.py lines 82-94)
-root_dir = "/nfs/DGX2/Workspace/avi/processed_data_independent3/"
+    # 自動設定預設模型路徑
+    if parsed.model_path is None:
+        finetuned_group_model = f"/mnt/usr1/avi/Projects/whisper_code/whisper-finetuned-{group_slug}/final_model"
+        formosan_v2_model = "/mnt/usr1/avi/Projects/whisper_code/whisper-finetuned-formosan-v2/final_model-evaluation/final_model"
+        if os.path.exists(finetuned_group_model):
+            parsed.model_path = finetuned_group_model
+        elif os.path.exists(formosan_v2_model):
+            parsed.model_path = formosan_v2_model
+        else:
+            parsed.model_path = parsed.base_model_name
 
-# 輸出推論結果檔名
-output_file = "/mnt/usr1/avi/Projects/whisper_code/transcriptions.csv"
+    # 自動設定預設輸出檔名
+    if parsed.output_file is None:
+        if group_slug != "all":
+            parsed.output_file = f"/mnt/usr1/avi/Projects/whisper_code/transcriptions_{group_slug}.csv"
+        else:
+            parsed.output_file = "/mnt/usr1/avi/Projects/whisper_code/transcriptions.csv"
 
-# 限制推論筆數 (例如前 200 筆；若要跑選定 parquet 的全量可設為 None)
-max_samples = None
+    return parsed
 
-# 推論目標語言 (預設: 印尼語 'id')
-target_language = "id"
+
+args = parse_args()
+model_path = args.model_path
+base_model_name = args.base_model_name
+root_dir = args.root_dir
+output_file = args.output_file
+max_samples = args.max_samples
+target_language = args.target_language
+language_group = args.language_group
+
+
+def filter_parquet_files(files, language_group, data_dir):
+    if not language_group or language_group.lower() == "all":
+        return sorted(files)
+    groups = [g.strip() for g in language_group.split(",") if g.strip()]
+    matched = []
+    for f in files:
+        rel = os.path.relpath(f, data_dir)
+        top_folder = rel.split(os.sep)[0]
+        if any(top_folder == g or top_folder.startswith(f"{g}_") or top_folder.startswith(g) for g in groups):
+            matched.append(f)
+    return sorted(matched)
+
 
 # %%
 # ===================== 載入 fine-tuned 模型與 processor =====================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"正在使用裝置: {device}")
+print(f"篩選目標語言組 (language_group): '{language_group}'")
+print(f"輸出目標檔案 (output_file): {output_file}")
 
 try:
     processor = WhisperProcessor.from_pretrained(model_path, language=target_language, task="transcribe")
@@ -49,12 +99,13 @@ print("模型載入成功！")
 
 # %%
 # ===================== 搜尋並載入 Parquet 資料集 =====================
-print(f"正在搜尋 {root_dir} 下的 Parquet 檔案...")
-parquet_files = sorted(glob.glob(f"{root_dir}/**/split=test/**/*.parquet", recursive=True))
-print(f"共找到 {len(parquet_files)} 個 parquet 檔案。")
+print(f"正在搜尋 {root_dir} 下的 Parquet 檔案 (language_group: '{language_group}')...")
+all_parquet_files = glob.glob(f"{root_dir}/**/split=test/**/*.parquet", recursive=True)
+parquet_files = filter_parquet_files(all_parquet_files, language_group, root_dir)
+print(f"共找到 {len(parquet_files)} 個符合的 parquet 檔案 (總共 {len(all_parquet_files)} 個)。")
 
 if not parquet_files:
-    raise FileNotFoundError(f"找不到任何 parquet 檔案於目錄: {root_dir}")
+    raise FileNotFoundError(f"找不到符合 language_group '{language_group}' 的 parquet 檔案於目錄: {root_dir}")
 
 print("正在依語言目錄分類並載入 Parquet 資料集...")
 files_by_lang = defaultdict(list)
