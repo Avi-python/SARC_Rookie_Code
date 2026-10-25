@@ -232,8 +232,8 @@ def parse_args():
     parser.add_argument(
         "--language",
         type=str,
-        default="id",
-        help="強制指定語言代碼 (如 id 為印尼語，zh, en 等；預設為 id)"
+        default="<|formosan|>",
+        help="強制指定語言代碼 (如 <|formosan|>, id, zh, en 等；預設為 <|formosan|>)"
     )
     return parser.parse_args()
 
@@ -242,10 +242,24 @@ def transcribe_audio(audio_data, model, processor, device, sample_rate=16000, la
     """執行特徵轉換與模型解碼推論"""
     inputs = processor(audio_data, sampling_rate=sample_rate, return_tensors="pt").to(device)
 
-    gen_kwargs = {}
+    gen_kwargs = {"task": "transcribe"}
     if language:
-        forced_decoder_ids = processor.get_decoder_prompt_ids(language=language, task="transcribe")
-        gen_kwargs["forced_decoder_ids"] = forced_decoder_ids
+        # 支援自訂語言 token (例如 <|formosan|>) 以及內建語言代碼
+        lang_str = language.strip()
+        if not lang_str.startswith("<|"):
+            lang_token = f"<|{lang_str}|>"
+        else:
+            lang_token = lang_str
+
+        # 若模型 generation_config 內有 lang_to_id 包含該 token，直接傳入 language 參數
+        if hasattr(model.generation_config, "lang_to_id") and model.generation_config.lang_to_id and lang_token in model.generation_config.lang_to_id:
+            gen_kwargs["language"] = lang_token
+        else:
+            try:
+                forced_decoder_ids = processor.get_decoder_prompt_ids(language=language, task="transcribe")
+                gen_kwargs["forced_decoder_ids"] = forced_decoder_ids
+            except Exception:
+                gen_kwargs["language"] = lang_token
 
     with torch.no_grad():
         predicted_ids = model.generate(inputs.input_features, **gen_kwargs)

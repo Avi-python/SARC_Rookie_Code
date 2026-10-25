@@ -3,10 +3,10 @@
 Whisper Multi-GPU Fine-Tuning Script
 ====================================
 Features:
-- Reads Parquet audio dataset directly from memory buffer (io.BytesIO).
-- Unified `prepare_example` function incorporating Parquet extraction & SpecAugment (Frequency & Time Masking).
+- Reads JSONL audio dataset (train.jsonl / dev.jsonl) and loads audio files from `audio_path`.
+- Uses `clean_text` without language filtering.
+- Unified `prepare_batch` function incorporating audio loading & SpecAugment (Frequency & Time Masking).
 - Full multi-GPU training support via PyTorch DDP / `torchrun` / Hugging Face Trainer.
-- Target language set to 毛利語 (Maori, language code 'mi') for both tokenizer and generation config.
 
 Usage:
   # 1. Multi-GPU training using torchrun (recommended for multi-GPU):
@@ -17,9 +17,7 @@ Usage:
 """
 
 import os
-import io
 import sys
-import glob
 import time
 import argparse
 import logging
@@ -30,6 +28,7 @@ import torchaudio.transforms as T
 import inspect
 from torch.nn.utils.rnn import pad_sequence
 from datasets import load_dataset
+from tokenizers import processors
 from transformers import (
     WhisperProcessor,
     WhisperForConditionalGeneration,
@@ -66,12 +65,15 @@ def parse_args():
         else "openai/whisper-large-v3-turbo"
     )
     parser.add_argument("--model_name", type=str, default=default_base_model, help="Base model name or path")
-    parser.add_argument("--language", type=str, default="id", help="Target language code (default: id for Indonesian / 印尼語)")
+    parser.add_argument("--language", type=str, default="<|formosan|>", help="Target language token or code (default: <|formosan|>)")
+    parser.add_argument("--init_lang_from", type=str, default="<|id|>", help="Existing language token used to warm-start custom language token embedding (default: <|id|>)")
     parser.add_argument("--task", type=str, default="transcribe", help="Task (transcribe or translate)")
-    parser.add_argument("--language_group", type=str, default="dru", help="Target language ID group (e.g. 'dru', or comma-separated 'dru,tsu'). Set to 'all' for all languages.")
-    parser.add_argument("--data_dir", type=str, default="/nfs/DGX2/Workspace/avi/processed_data_independent3/", help="Parquet dataset root directory")
-    parser.add_argument("--output_dir", type=str, default=None, help="Output directory (default: whisper-finetuned-<language_group>)")
+    parser.add_argument("--data_dir", type=str, default="/nfs/DGX2/Workspace/avi/FormosanBank/asr_dataset/", help="JSONL dataset root directory containing train.jsonl and dev.jsonl")
+    parser.add_argument("--train_file", type=str, default=None, help="Path to train.jsonl (default: <data_dir>/train.jsonl)")
+    parser.add_argument("--dev_file", type=str, default=None, help="Path to dev.jsonl (default: <data_dir>/dev.jsonl)")
+    parser.add_argument("--output_dir", type=str, default="/mnt/usr1/avi/Projects/whisper_code/whisper-finetuned-formosan-v2", help="Output directory")
     parser.add_argument("--epochs", type=float, default=6, help="Number of training epochs")
+    parser.add_argument("--max_steps", type=int, default=-1, help="If > 0: set total number of training steps to perform (overrides epochs)")
     parser.add_argument("--per_device_train_batch_size", type=int, default=2, help="Batch size per GPU")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=6, help="Gradient accumulation steps")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
@@ -81,18 +83,17 @@ def parse_args():
     parser.add_argument("--per_device_eval_batch_size", type=int, default=2, help="Batch size per GPU for evaluation")
     parser.add_argument("--early_stopping_patience", type=int, default=3, help="Early stopping patience (number of evaluations without improvement before stopping, 0 to disable)")
     parser.add_argument("--early_stopping_threshold", type=float, default=0.0, help="Minimum change in monitored metric to qualify as an improvement")
+    parser.add_argument("--max_train_samples", type=int, default=None, help="Optional maximum number of samples from train dataset (useful for smoke testing)")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="Optional maximum number of samples from dev dataset to evaluate")
     parser.add_argument("--logging_steps", type=int, default=10, help="Logging steps")
     parser.add_argument("--resume_from_checkpoint", action="store_true", default=True, help="Resume from last checkpoint if exists")
     parser.add_argument("--num_proc", type=int, default=8, help="Number of CPU workers for on-the-fly DataLoader preprocessing")
     parsed = parser.parse_known_args()[0]
 
-    if parsed.output_dir is None:
-        if parsed.language_group and parsed.language_group.lower() != "all":
-            group_slug = parsed.language_group.replace(",", "_").replace(" ", "_")
-            parsed.output_dir = f"/mnt/usr1/avi/Projects/whisper_code/whisper-finetuned-formosan-{group_slug}"
-        else:
-            parsed.output_dir = "/mnt/usr1/avi/Projects/whisper_code/whisper-finetuned-formosan-v2"
+    if parsed.train_file is None:
+        parsed.train_file = os.path.join(parsed.data_dir, "train.jsonl")
+    if parsed.dev_file is None:
+        parsed.dev_file = os.path.join(parsed.data_dir, "dev.jsonl")
     return parsed
 
 
@@ -107,19 +108,59 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-# %% 載入 Whisper Processor 與 Model (指定語言為印尼語 'id')
-logging.info(f"Loading Whisper processor ({args.model_name}) with language='{args.language}', task='{args.task}'...")
-processor = WhisperProcessor.from_pretrained(args.model_name, language=args.language, task=args.task)
+# %% 載入 Whisper Processor 與 Model 並註冊自訂語言 Token (如 <|formosan|>)
+lang_token = args.language if args.language.startswith("<|") else f"<|{args.language}|>"
+logging.info(f"Loading Whisper processor ({args.model_name})...")
+processor = WhisperProcessor.from_pretrained(args.model_name)
 
 logging.info(f"Loading Whisper model ({args.model_name})...")
 model = WhisperForConditionalGeneration.from_pretrained(args.model_name, torch_dtype=torch.float32)
 
-# Ensure target language ('id') and task ('transcribe') tokens are set in generation_config
+# 新增自訂語言 token 至 tokenizer 並擴充模型 embedding
+num_added = processor.tokenizer.add_special_tokens(
+    {"additional_special_tokens": [lang_token]}
+)
+lang_token_id = processor.tokenizer.convert_tokens_to_ids(lang_token)
+
+if num_added > 0:
+    logging.info(f"Added new language token '{lang_token}' (id={lang_token_id}). Resizing model token embeddings to {len(processor.tokenizer)}...")
+    model.resize_token_embeddings(len(processor.tokenizer))
+    init_token_id = processor.tokenizer.convert_tokens_to_ids(args.init_lang_from)
+    if init_token_id != processor.tokenizer.unk_token_id:
+        with torch.no_grad():
+            model.model.decoder.embed_tokens.weight[lang_token_id] = (
+                model.model.decoder.embed_tokens.weight[init_token_id].clone()
+            )
+        logging.info(f"Initialized '{lang_token}' embedding from '{args.init_lang_from}' (id={init_token_id}).")
+else:
+    logging.info(f"Language token '{lang_token}' (id={lang_token_id}) already exists in tokenizer.")
+
+# 設定 tokenizer post-processor 自動加上 prefix:
+# <|startoftranscript|> <|formosan|> <|transcribe|> <|notimestamps|> ... <|endoftext|>
+sot_token = "<|startoftranscript|>"
+task_token = f"<|{args.task}|>"
+notimestamps_token = "<|notimestamps|>"
+eos_token = processor.tokenizer.eos_token
+
+prefix_tokens = [sot_token, lang_token, task_token, notimestamps_token]
+prefix_ids = processor.tokenizer.convert_tokens_to_ids(prefix_tokens)
+eos_id = processor.tokenizer.eos_token_id
+
+prefix_template = " ".join([f"{tok}:0" for tok in prefix_tokens])
+processor.tokenizer.backend_tokenizer.post_processor = processors.TemplateProcessing(
+    single=f"{prefix_template} $A:0 {eos_token}:0",
+    pair=f"{prefix_template} $A:0 $B:1 {eos_token}:1",
+    special_tokens=[(eos_token, eos_id), *zip(prefix_tokens, prefix_ids)],
+)
+
+# 將自訂語言 token 註冊進 generation_config.lang_to_id
+if hasattr(model.generation_config, "lang_to_id") and model.generation_config.lang_to_id is not None:
+    model.generation_config.lang_to_id[lang_token] = lang_token_id
 model.config.forced_decoder_ids = None
-model.generation_config.language = args.language
+model.generation_config.language = lang_token
 model.generation_config.task = args.task
 model.generation_config.forced_decoder_ids = None
-logging.info(f"Model and Processor loaded successfully with target language: {args.language}!")
+logging.info(f"Model and Processor configured successfully with target language token: {lang_token} (id={lang_token_id})!")
 
 
 # %% SpecAugment 轉換設定 (頻譜遮罩增強: Frequency & Time Masking)
@@ -129,31 +170,33 @@ time_masking = T.TimeMasking(time_mask_param=100)
 
 def prepare_batch(batch, is_train=True):
     """
-    音訊即時預處理 + Parquet 解析 + 動態 SpecAugment (僅訓練集) + 標籤 Tokenizer (印尼語)
+    音訊即時預處理 + 讀取 audio_path + 動態 SpecAugment (僅訓練集) + 標籤 Tokenizer (clean_text)
     使用 set_transform 在 DataLoader 多核心 CPU 即時平行運算，不佔用任何硬碟快取。
     """
     input_features_list = []
     labels_list = []
 
-    audio_bytes_list = batch["audio_bytes"] if isinstance(batch.get("audio_bytes"), list) else [batch.get("audio_bytes")]
-    text_list = batch["text"] if isinstance(batch.get("text"), list) else [batch.get("text")]
+    audio_path_list = batch["audio_path"] if isinstance(batch.get("audio_path"), list) else [batch.get("audio_path")]
+    text_list = batch["clean_text"] if isinstance(batch.get("clean_text"), list) else [batch.get("clean_text")]
 
-    for audio_raw, text in zip(audio_bytes_list, text_list):
+    for audio_path, text in zip(audio_path_list, text_list):
         speech_array = None
-        if audio_raw is not None:
+        if audio_path is not None and os.path.exists(audio_path):
             try:
-                # 1. 提取 Parquet raw bytes 並由記憶體 buffer 讀取
-                audio_bytes = np.array(audio_raw, dtype=np.int8).view(np.uint8).tobytes()
-                speech_array, sr_orig = torchaudio.load(io.BytesIO(audio_bytes))
+                # 1. 由 audio_path 讀取音訊檔
+                speech_array, sr_orig = torchaudio.load(audio_path)
+                # 若為多聲道則轉為單聲道
+                if speech_array.shape[0] > 1:
+                    speech_array = speech_array.mean(dim=0, keepdim=True)
                 # 2. 若取樣率非 16000Hz 則重取樣
                 if sr_orig != sr:
                     resampler = T.Resample(sr_orig, sr)
                     speech_array = resampler(speech_array)
-                speech_array = speech_array.squeeze().numpy()
+                speech_array = speech_array.squeeze(0).numpy()
             except Exception:
                 speech_array = None
 
-        if speech_array is None or len(speech_array) == 0:
+        if speech_array is None or len(speech_array) == 0 or not text:
             # 若音訊損壞或讀取失敗，使用 1 秒靜音作為 fallback，標籤設為 -100 (計算 loss 時自動忽略)
             speech_array = np.zeros(sr, dtype=np.float32)
             input_features = processor.feature_extractor(speech_array, sampling_rate=sr).input_features[0]
@@ -191,53 +234,27 @@ def prepare_eval_batch(batch):
     return prepare_batch(batch, is_train=False)
 
 
-def filter_parquet_files(files, language_group, data_dir):
-    if not language_group or language_group.lower() == "all":
-        return sorted(files)
-    groups = [g.strip() for g in language_group.split(",") if g.strip()]
-    matched = []
-    for f in files:
-        rel = os.path.relpath(f, data_dir)
-        top_folder = rel.split(os.sep)[0]
-        if any(top_folder == g or top_folder.startswith(f"{g}_") or top_folder.startswith(g) for g in groups):
-            matched.append(f)
-    return sorted(matched)
+# %% 載入 JSONL 資料集 (Train & Dev)
+if not os.path.exists(args.train_file):
+    raise FileNotFoundError(f"Train JSONL file not found: {args.train_file}")
 
-
-# %% 搜尋並載入 Parquet 資料集 (Train & Dev)
-logging.info(f"Searching train parquet files under {args.data_dir} (language_group: '{args.language_group}')...")
-all_train_parquet_files = glob.glob(f"{args.data_dir}/**/split=train/**/*.parquet", recursive=True)
-train_parquet_files = filter_parquet_files(all_train_parquet_files, args.language_group, args.data_dir)
-logging.info(f"Found {len(train_parquet_files)} matching train parquet files (out of {len(all_train_parquet_files)} total):")
-for f in train_parquet_files:
-    rel_dialect = os.path.relpath(f, args.data_dir).split(os.sep)[0]
-    logging.info(f"  - Train dialect [{rel_dialect}]: {f}")
-
-if not train_parquet_files:
-    raise FileNotFoundError(f"No train parquet files found matching language_group '{args.language_group}' under directory: {args.data_dir}")
-
-logging.info("Loading train dataset via Hugging Face `load_dataset`...")
-train_dataset = load_dataset("parquet", data_files={"train": train_parquet_files}, split="train")
+logging.info(f"Loading train dataset from {args.train_file} via Hugging Face `load_dataset`...")
+train_dataset = load_dataset("json", data_files={"train": args.train_file}, split="train")
+if args.max_train_samples is not None and args.max_train_samples < len(train_dataset):
+    logging.info(f"Subsampling train dataset to {args.max_train_samples} records.")
+    train_dataset = train_dataset.select(range(args.max_train_samples))
 logging.info(f"Train dataset loaded successfully! Total records: {len(train_dataset)}")
 
-logging.info(f"Searching dev parquet files under {args.data_dir} (language_group: '{args.language_group}')...")
-all_dev_parquet_files = glob.glob(f"{args.data_dir}/**/split=dev/**/*.parquet", recursive=True)
-dev_parquet_files = filter_parquet_files(all_dev_parquet_files, args.language_group, args.data_dir)
-logging.info(f"Found {len(dev_parquet_files)} matching dev parquet files (out of {len(all_dev_parquet_files)} total):")
-for f in dev_parquet_files:
-    rel_dialect = os.path.relpath(f, args.data_dir).split(os.sep)[0]
-    logging.info(f"  - Dev dialect [{rel_dialect}]: {f}")
-
 eval_dataset = None
-if dev_parquet_files:
-    logging.info("Loading dev dataset via Hugging Face `load_dataset`...")
-    eval_dataset = load_dataset("parquet", data_files={"dev": dev_parquet_files}, split="dev")
+if args.dev_file and os.path.exists(args.dev_file):
+    logging.info(f"Loading dev dataset from {args.dev_file} via Hugging Face `load_dataset`...")
+    eval_dataset = load_dataset("json", data_files={"dev": args.dev_file}, split="dev")
     if args.max_eval_samples is not None and args.max_eval_samples < len(eval_dataset):
         logging.info(f"Subsampling dev dataset to {args.max_eval_samples} records for evaluation.")
         eval_dataset = eval_dataset.select(range(args.max_eval_samples))
     logging.info(f"Dev dataset loaded successfully! Total records: {len(eval_dataset)}")
 else:
-    logging.warning(f"No dev parquet files found under {args.data_dir} matching '{args.language_group}' with split=dev. Evaluation and early stopping will be disabled.")
+    logging.warning(f"No dev JSONL file found at {args.dev_file}. Evaluation and early stopping will be disabled.")
 
 
 # %% 訓練與評估設定 (支援多 GPU 分散式訓練 DDP + 多 CPU 核心 DataLoader 即時資料處理)
@@ -271,6 +288,7 @@ training_args = TrainingArguments(
     per_device_train_batch_size=args.per_device_train_batch_size,
     gradient_accumulation_steps=args.gradient_accumulation_steps,
     num_train_epochs=args.epochs,
+    max_steps=args.max_steps,
     learning_rate=args.learning_rate,
     warmup_steps=args.warmup_steps,
     logging_steps=args.logging_steps,
@@ -328,9 +346,14 @@ if __name__ == "__main__":
             logging.info(f"Found checkpoint, resuming from: {checkpoint}")
         else:
             logging.info("No checkpoint found in output directory. Starting from scratch.")
-    trainer.train(resume_from_checkpoint=checkpoint)
+    train_result = trainer.train(resume_from_checkpoint=checkpoint)
 
-    logging.info("Training finished! Saving final model...")
-    trainer.save_model(os.path.join(args.output_dir, "final_model"))
-    processor.save_pretrained(os.path.join(args.output_dir, "final_model"))
-    logging.info("Model and processor saved successfully!")
+    logging.info("Training finished! Saving final model and training state...")
+    final_model_dir = os.path.join(args.output_dir, "final_model")
+    trainer.save_model(final_model_dir)
+    processor.save_pretrained(final_model_dir)
+
+    trainer.log_metrics("train", train_result.metrics)
+    trainer.save_metrics("train", train_result.metrics)
+    trainer.save_state()  # Saves full trainer_state.json directly to args.output_dir
+    logging.info(f"Model and processor saved to '{final_model_dir}', trainer_state saved to '{args.output_dir}'!")
